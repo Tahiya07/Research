@@ -38,9 +38,11 @@ Constraints
 from __future__ import annotations
 
 import logging
+import os
 import random
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 import numpy as np
@@ -89,6 +91,34 @@ def _ok(msg: str) -> None:
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBED_DIM = 384  # all-MiniLM-L6-v2 produces 384-dim embeddings
+
+
+def _resolve_local_model_path(model_name: str) -> Optional[str]:
+    """Resolve a SentenceTransformer model to a local path when possible."""
+    candidate = Path(model_name).expanduser()
+    if candidate.exists():
+        return str(candidate)
+
+    repo_id = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+    cache_root = (
+        Path(os.environ.get("HF_HUB_CACHE", ""))
+        if os.environ.get("HF_HUB_CACHE")
+        else Path.home() / ".cache" / "huggingface" / "hub"
+    )
+    model_cache = cache_root / f"models--{repo_id.replace('/', '--')}"
+    refs_main = model_cache / "refs" / "main"
+    snapshots = model_cache / "snapshots"
+
+    if refs_main.is_file():
+        snapshot = snapshots / refs_main.read_text(encoding="utf-8").strip()
+        if snapshot.is_dir():
+            return str(snapshot)
+
+    if snapshots.is_dir():
+        for snapshot in sorted(snapshots.iterdir(), reverse=True):
+            if snapshot.is_dir() and (snapshot / "modules.json").is_file():
+                return str(snapshot)
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -156,7 +186,19 @@ class PrivacyRetriever:
     def model(self) -> SentenceTransformer:
         if self._model is None:
             logger.info(f"Loading embedding model '{self.model_name}' on CPU")
-            self._model = SentenceTransformer(self.model_name, device="cpu")
+            model_ref = _resolve_local_model_path(self.model_name) or self.model_name
+            try:
+                self._model = SentenceTransformer(
+                    model_ref,
+                    device="cpu",
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not load the embedding model from local files only. "
+                    f"Expected cached Hugging Face files for '{self.model_name}' "
+                    "or a valid local model path."
+                ) from exc
         return self._model
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
