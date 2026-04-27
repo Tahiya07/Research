@@ -73,6 +73,7 @@ from typing import (
 
 import numpy as np
 
+print("EVALUATE STARTED")
 # ----------------------------------------------------------------------------
 # Reproducibility (mandated global rule)
 # ----------------------------------------------------------------------------
@@ -3260,6 +3261,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg.dataset_type = args.benchmark
         pipe = EvaluationPipeline(cfg)
         pipe.run_benchmark()
+        pipe = EvaluationPipeline(cfg)
+
+        print(">>> Starting evaluation pipeline...")
+        pipe.run()
+
+        print(">>> Evaluation finished")
         # final_system_check is OBE-shaped; for non-OBE benchmarks we
         # simply confirm the result blocks were populated.
         ok = bool(pipe.results)
@@ -3378,8 +3385,11 @@ def _self_test() -> None:
     _ok("Evaluation + Visualization pipeline complete")
     _ok("Phase-7 benchmark routing verified (OBE + ScienceQA + Privacy)")
 
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        raise SystemExit(main(sys.argv[1:]))
-    _self_test()
+    import sys
+
+    print("CALLING MAIN")
+
+    exit_code = main(sys.argv[1:])
+
+    print("MAIN FINISHED with code:", exit_code)

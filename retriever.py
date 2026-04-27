@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover
 # Required deps (assumed installed)
 # ----------------------------------------------------------------------------
 import faiss  # type: ignore[import-not-found]
-from sentence_transformers import SentenceTransformer
+from encoder_backends import StableTextEncoder
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -90,35 +90,7 @@ def _ok(msg: str) -> None:
 # Constants
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
-EMBED_DIM = 384  # all-MiniLM-L6-v2 produces 384-dim embeddings
-
-
-def _resolve_local_model_path(model_name: str) -> Optional[str]:
-    """Resolve a SentenceTransformer model to a local path when possible."""
-    candidate = Path(model_name).expanduser()
-    if candidate.exists():
-        return str(candidate)
-
-    repo_id = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
-    cache_root = (
-        Path(os.environ.get("HF_HUB_CACHE", ""))
-        if os.environ.get("HF_HUB_CACHE")
-        else Path.home() / ".cache" / "huggingface" / "hub"
-    )
-    model_cache = cache_root / f"models--{repo_id.replace('/', '--')}"
-    refs_main = model_cache / "refs" / "main"
-    snapshots = model_cache / "snapshots"
-
-    if refs_main.is_file():
-        snapshot = snapshots / refs_main.read_text(encoding="utf-8").strip()
-        if snapshot.is_dir():
-            return str(snapshot)
-
-    if snapshots.is_dir():
-        for snapshot in sorted(snapshots.iterdir(), reverse=True):
-            if snapshot.is_dir() and (snapshot / "modules.json").is_file():
-                return str(snapshot)
-    return None
+EMBED_DIM = 384
 
 
 # ----------------------------------------------------------------------------
@@ -151,7 +123,7 @@ class PrivacyRetriever:
         Privacy-penalty coefficient lambda; final score = cos - lambda * risk.
     normalize : bool
         L2-normalise embeddings (so dot product == cosine).
-    model : Optional[SentenceTransformer]
+    model : Optional[StableTextEncoder]
         Optional pre-loaded encoder (used for dependency injection / tests).
     """
 
@@ -161,7 +133,7 @@ class PrivacyRetriever:
         temperature: float = 0.07,
         lambda_privacy: float = 0.5,
         normalize: bool = True,
-        model: Optional[SentenceTransformer] = None,
+        model: Optional[StableTextEncoder] = None,
     ) -> None:
         if temperature <= 0:
             raise ValueError("temperature must be > 0")
@@ -173,7 +145,7 @@ class PrivacyRetriever:
         self.lambda_privacy = float(lambda_privacy)
         self.normalize = bool(normalize)
 
-        self._model: Optional[SentenceTransformer] = model
+        self._model: Optional[StableTextEncoder] = model
         self._index: Optional[faiss.Index] = None
         self._embeddings: Optional[np.ndarray] = None
         self._docs: List[str] = []
@@ -183,22 +155,15 @@ class PrivacyRetriever:
     # Encoder (lazy load)
     # ------------------------------------------------------------------ #
     @property
-    def model(self) -> SentenceTransformer:
+    def model(self) -> StableTextEncoder:
         if self._model is None:
             logger.info(f"Loading embedding model '{self.model_name}' on CPU")
-            model_ref = _resolve_local_model_path(self.model_name) or self.model_name
-            try:
-                self._model = SentenceTransformer(
-                    model_ref,
-                    device="cpu",
-                    local_files_only=True,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Could not load the embedding model from local files only. "
-                    f"Expected cached Hugging Face files for '{self.model_name}' "
-                    "or a valid local model path."
-                ) from exc
+            self._model = StableTextEncoder(
+                self.model_name,
+                device="cpu",
+                local_files_only=True,
+                n_features=EMBED_DIM,
+            )
         return self._model
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:

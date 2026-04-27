@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import joblib
 import numpy as np
 
 # ----------------------------------------------------------------------------
@@ -73,7 +74,7 @@ try:
 except Exception:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from sentence_transformers import SentenceTransformer
+from encoder_backends import StableTextEncoder
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -118,6 +119,8 @@ DEFAULT_OBE_SEARCH_PATHS: List[str] = [
 DEFAULT_WEIGHTS_PATH = "./models/bloom_ldl_weights.npz"
 
 DEFAULT_FIGSHARE_SEARCH_PATHS: List[str] = [
+    "./data/curated_bloom_corpus.csv",
+    "./data/figshare_combined_dataset.csv",
     "./data/exam_combined_dataset.csv",
     "./data/datasets/exam_combined_dataset.csv",
     "./exam_combined_dataset.csv",
@@ -160,6 +163,10 @@ def _normalise_bloom(label: object) -> Optional[str]:
     if not s:
         return None
     return _BLOOM_ALIASES.get(s)
+
+
+def _clean_text(value: object) -> str:
+    return " ".join(str(value).strip().split())
 
 
 # ----------------------------------------------------------------------------
@@ -209,17 +216,28 @@ def load_obe_dataset(
         )
     import pandas as pd  # local import to avoid hard dep at module load
 
-    usecols = [text_field, "bloom_level"]
+    bloom_candidates = ("bloom_level", "bloom")
+    cognitive_candidates = ("cognitive_skill", "cognitive")
+    usecols = [text_field, *bloom_candidates]
     try:
         head = pd.read_csv(p, nrows=1)
-        if "cognitive_skill" in head.columns:
-            usecols.append("cognitive_skill")
+        cols = {str(c).strip().lower(): c for c in head.columns}
+        for cand in cognitive_candidates:
+            if cand in cols:
+                usecols.append(cols[cand])
+        for cand in bloom_candidates:
+            if cand in cols:
+                usecols.append(cols[cand])
     except Exception:
         pass
     df = pd.read_csv(p, usecols=lambda c: c in set(usecols), low_memory=False)
-    df = df.dropna(subset=[text_field, "bloom_level"])
+    bloom_col = "bloom_level" if "bloom_level" in df.columns else ("bloom" if "bloom" in df.columns else None)
+    if bloom_col is None:
+        raise RuntimeError(f"OBE dataset at {p} missing a Bloom label column (expected bloom_level or bloom)")
+    cog_col = "cognitive_skill" if "cognitive_skill" in df.columns else ("cognitive" if "cognitive" in df.columns else None)
+    df = df.dropna(subset=[text_field, bloom_col])
     df["bloom_level"] = (
-        df["bloom_level"].astype(str).str.strip().str.capitalize()
+        df[bloom_col].astype(str).str.strip().str.capitalize()
     )
     df = df[df["bloom_level"].isin(BLOOM_LEVELS)]
     df[text_field] = df[text_field].astype(str).str.strip()
@@ -243,8 +261,8 @@ def load_obe_dataset(
         .reset_index(drop=True)
     )
     raw_q = out[text_field].astype(str).tolist()
-    if "cognitive_skill" in out.columns:
-        cog = out["cognitive_skill"].astype(str).str.strip()
+    if cog_col and cog_col in out.columns:
+        cog = out[cog_col].astype(str).str.strip()
         texts = [
             f"[cognitive={c}] {q}".strip() if c and c.lower() != "nan" else q
             for q, c in zip(raw_q, cog)
@@ -349,6 +367,57 @@ def load_figshare_exam_dataset(
     return texts, labels
 
 
+def load_curated_bloom_dataset(
+    path: Optional[Union[str, Path]] = None,
+    max_per_class: int = 2000,
+    seed: int = 42,
+) -> Tuple[List[str], List[str]]:
+    """Load the curated Bloom corpus if present, otherwise fall back to Figshare.
+
+    Expected curated schema:
+      - question
+      - bloom_level
+    """
+    p = _find_figshare_exam_dataset(str(path) if path else None)
+    if p is None:
+        raise FileNotFoundError(
+            "Curated Bloom dataset not found and no Figshare fallback available. "
+            f"Searched: {DEFAULT_FIGSHARE_SEARCH_PATHS}"
+        )
+    import pandas as pd  # local import
+
+    df = pd.read_csv(p, low_memory=False)
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    if "question" in cols and "bloom_level" in cols:
+        qcol = cols["question"]
+        lcol = cols["bloom_level"]
+        df = df.dropna(subset=[qcol, lcol])
+        df[qcol] = df[qcol].astype(str).str.strip()
+        df[lcol] = df[lcol].apply(_normalise_bloom)
+        df = df[df[qcol].str.len() > 0]
+        df = df[df[lcol].notna()]
+        df[lcol] = df[lcol].astype(str)
+        rng = np.random.default_rng(seed)
+        parts = []
+        for lvl in BLOOM_LEVELS:
+            sub = df[df[lcol] == lvl]
+            if len(sub) == 0:
+                continue
+            n = min(len(sub), int(max_per_class))
+            idx = rng.choice(len(sub), size=n, replace=False)
+            parts.append(sub.iloc[idx])
+        out = (
+            __import__("pandas").concat(parts)
+            .sample(frac=1.0, random_state=int(seed))
+            .reset_index(drop=True)
+        )
+        texts = out[qcol].astype(str).tolist()
+        labels = out[lcol].astype(str).tolist()
+        logger.info(f"Curated Bloom dataset: {len(texts)} rows ({max_per_class}/class) loaded from {p}")
+        return texts, labels
+    return load_figshare_exam_dataset(path=p, max_per_class=max_per_class, seed=seed)
+
+
 # ----------------------------------------------------------------------------
 # Output container
 # ----------------------------------------------------------------------------
@@ -361,6 +430,269 @@ class ClassifierOutput:
     levels: List[str] = field(default_factory=lambda: list(BLOOM_LEVELS))
 
 
+@dataclass
+class OBEClassifierOutput:
+    bloom_level: str
+    cognitive_skill: str
+    subject: str
+    topic: str
+    subtopic: str
+    difficulty: str
+    source_type: str
+    language: str
+    confidence: float
+    support_count: int
+    nearest_examples: List[Dict[str, str]] = field(default_factory=list)
+
+
+class LocalOBEClassifier:
+    """Offline kNN-style OBE metadata classifier over the local CSV."""
+
+    def __init__(
+        self,
+        encoder: Optional[StableTextEncoder] = None,
+        dataset_path: Optional[Union[str, Path]] = None,
+        max_rows: int = 6000,
+        k: int = 5,
+        model_dir: Union[str, Path] = "./models",
+    ) -> None:
+        if k <= 0:
+            raise ValueError("k must be > 0")
+        self.encoder = encoder
+        self.model_dir = Path(model_dir)
+        self.dataset_path = _find_obe_dataset(str(dataset_path) if dataset_path else None)
+        if self.dataset_path is None:
+            raise FileNotFoundError(
+                "OBE dataset not found for LocalOBEClassifier. "
+                "Set OBE_DATASET_PATH or place data/obe_dataset.csv locally."
+            )
+        self.max_rows = int(max_rows)
+        self.k = int(k)
+        self._rows: List[Dict[str, str]] = []
+        self._embeddings: Optional[np.ndarray] = None
+        self._pipelines: Dict[str, object] = {}
+
+    @staticmethod
+    def _clean(value: object, fallback: str = "Unknown") -> str:
+        s = str(value).strip()
+        if not s or s.lower() == "nan":
+            return fallback
+        return s
+
+    def _load_rows(self) -> None:
+        if self._rows and self._embeddings is not None:
+            return
+        if self.encoder is None:
+            raise RuntimeError("encoder is required for kNN fallback when trained pipelines are unavailable")
+        import pandas as pd
+
+        df = pd.read_csv(self.dataset_path, low_memory=False)
+        wanted = [
+            "question", "bloom_level", "cognitive_skill", "subject", "topic",
+            "subtopic", "difficulty", "source_type", "language",
+        ]
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        missing = [c for c in ("question", "bloom_level") if c not in cols]
+        if missing:
+            raise RuntimeError(
+                f"OBE dataset at {self.dataset_path} missing required columns: {missing}"
+            )
+        rename = {cols[c]: c for c in cols if c in wanted}
+        df = df.rename(columns=rename)
+        keep = [c for c in wanted if c in df.columns]
+        df = df[keep].dropna(subset=["question", "bloom_level"])
+        df["question"] = df["question"].astype(str).str.strip()
+        df = df[df["question"].str.len() > 0]
+        if len(df) == 0:
+            raise RuntimeError(f"OBE dataset at {self.dataset_path} has no usable rows")
+        if len(df) > self.max_rows:
+            df = df.sample(n=self.max_rows, random_state=42).reset_index(drop=True)
+
+        rows: List[Dict[str, str]] = []
+        for rec in df.to_dict(orient="records"):
+            bloom = _normalise_bloom(rec.get("bloom_level")) or "Understand"
+            rows.append(
+                {
+                    "question": self._clean(rec.get("question"), fallback=""),
+                    "bloom_level": bloom,
+                    "cognitive_skill": self._clean(rec.get("cognitive_skill")),
+                    "subject": self._clean(rec.get("subject")),
+                    "topic": self._clean(rec.get("topic")),
+                    "subtopic": self._clean(rec.get("subtopic")),
+                    "difficulty": self._clean(rec.get("difficulty")),
+                    "source_type": self._clean(rec.get("source_type")),
+                    "language": self._clean(rec.get("language")),
+                }
+            )
+        texts = [r["question"] for r in rows]
+        emb = self.encoder.encode(
+            texts,
+            batch_size=64,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        ).astype(np.float32, copy=False)
+        if emb.ndim == 1:
+            emb = emb[None, :]
+        self._rows = rows
+        self._embeddings = np.ascontiguousarray(emb, dtype=np.float32)
+
+    def _load_pipelines(self) -> None:
+        if self._pipelines:
+            return
+        targets = ["bloom_level", "cognitive_skill", "difficulty", "source_type", "subject"]
+        candidates = {
+            "bloom_level": [
+                self.model_dir / "curated_bloom_tfidf.joblib",
+                self.model_dir / "figshare_bloom_tfidf.joblib",
+                self.model_dir / "obe_bloom_tfidf.joblib",
+                self.model_dir / "obe_bloom_level_tfidf.joblib",
+            ],
+            "cognitive_skill": [self.model_dir / "obe_cognitive_skill_tfidf.joblib"],
+            "difficulty": [self.model_dir / "obe_difficulty_tfidf.joblib"],
+            "source_type": [self.model_dir / "obe_source_type_tfidf.joblib"],
+            "subject": [self.model_dir / "obe_subject_tfidf.joblib"],
+        }
+        loaded: Dict[str, object] = {}
+        for target in targets:
+            p = next((path for path in candidates[target] if path.is_file()), None)
+            if p is None:
+                self._pipelines = {}
+                return
+            loaded[target] = joblib.load(p)
+        self._pipelines = loaded
+
+    def _nearest_examples_lexical(self, text: str, top_n: int = 3) -> List[Dict[str, str]]:
+        q_tokens = set(_clean_text(text).lower().split())
+        if not q_tokens:
+            return []
+
+        import csv
+
+        scored = []
+        with self.dataset_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            fieldnames = {str(name).strip().lower(): str(name) for name in (reader.fieldnames or [])}
+            qcol = fieldnames.get("question")
+            bcol = fieldnames.get("bloom_level")
+            scol = fieldnames.get("subject")
+            tcol = fieldnames.get("topic")
+            if qcol is None:
+                return []
+            for i, rec in enumerate(reader):
+                if i >= 5000:
+                    break
+                doc_text = _clean_text(rec.get(qcol, ""))
+                if not doc_text:
+                    continue
+                score = len(q_tokens & set(doc_text.lower().split()))
+                if score > 0:
+                    scored.append(
+                        (
+                            score,
+                            {
+                                "question": doc_text,
+                                "bloom_level": _clean_text(rec.get(bcol, "")) if bcol else "",
+                                "subject": _clean_text(rec.get(scol, "")) if scol else "",
+                                "topic": _clean_text(rec.get(tcol, "")) if tcol else "",
+                            },
+                        )
+                    )
+        scored.sort(key=lambda x: (-x[0], x[1]["question"]))
+        rows: List[Dict[str, str]] = []
+        for _, rec in scored[:top_n]:
+            rows.append(rec)
+        return rows
+
+    @staticmethod
+    def _majority(rows: Sequence[Dict[str, str]], field: str) -> tuple[str, int]:
+        counts: Dict[str, int] = {}
+        for row in rows:
+            key = row.get(field, "Unknown") or "Unknown"
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return "Unknown", 0
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        return best[0], best[1]
+
+    def predict(self, text: str) -> OBEClassifierOutput:
+        if not isinstance(text, str):
+            raise TypeError("predict() expects a single string")
+        if not text.strip():
+            raise ValueError("text must be a non-empty string")
+        self._load_pipelines()
+        if self._pipelines:
+            bloom_pipe = self._pipelines["bloom_level"]
+            bloom = str(bloom_pipe.predict([text])[0])
+            cog = str(self._pipelines["cognitive_skill"].predict([text])[0])
+            difficulty = str(self._pipelines["difficulty"].predict([text])[0])
+            source_type = str(self._pipelines["source_type"].predict([text])[0])
+            subject = str(self._pipelines["subject"].predict([text])[0])
+            conf = 0.0
+            if hasattr(bloom_pipe, "predict_proba"):
+                probs = bloom_pipe.predict_proba([text])[0]
+                conf = float(np.max(probs))
+            examples = self._nearest_examples_lexical(text)
+            return OBEClassifierOutput(
+                bloom_level=bloom,
+                cognitive_skill=cog,
+                subject=subject,
+                topic=examples[0]["topic"] if examples else "Unknown",
+                subtopic="Unknown",
+                difficulty=difficulty,
+                source_type=source_type,
+                language="Unknown",
+                confidence=conf,
+                support_count=len(examples),
+                nearest_examples=examples,
+            )
+        self._load_rows()
+        assert self._embeddings is not None
+        q = self.encoder.encode(
+            [text],
+            batch_size=1,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        ).astype(np.float32, copy=False)
+        sims = (q @ self._embeddings.T).squeeze(0)
+        k = min(self.k, len(self._rows))
+        idx = np.argsort(-sims)[:k]
+        nn = [self._rows[int(i)] for i in idx]
+
+        bloom, bloom_votes = self._majority(nn, "bloom_level")
+        cog, _ = self._majority(nn, "cognitive_skill")
+        subject, _ = self._majority(nn, "subject")
+        topic, _ = self._majority(nn, "topic")
+        subtopic, _ = self._majority(nn, "subtopic")
+        difficulty, _ = self._majority(nn, "difficulty")
+        source_type, _ = self._majority(nn, "source_type")
+        language, _ = self._majority(nn, "language")
+        conf = float(max(0.0, min(1.0, bloom_votes / max(1, k))))
+        examples = [
+            {
+                "question": row["question"],
+                "bloom_level": row["bloom_level"],
+                "subject": row["subject"],
+                "topic": row["topic"],
+            }
+            for row in nn[:3]
+        ]
+        return OBEClassifierOutput(
+            bloom_level=bloom,
+            cognitive_skill=cog,
+            subject=subject,
+            topic=topic,
+            subtopic=subtopic,
+            difficulty=difficulty,
+            source_type=source_type,
+            language=language,
+            confidence=conf,
+            support_count=bloom_votes,
+            nearest_examples=examples,
+        )
+
+
 # ----------------------------------------------------------------------------
 # BloomLDLClassifier
 # ----------------------------------------------------------------------------
@@ -369,7 +701,7 @@ class BloomLDLClassifier:
 
     def __init__(
         self,
-        encoder: Optional[SentenceTransformer] = None,
+        encoder: Optional[StableTextEncoder] = None,
         encoder_name: str = "all-MiniLM-L6-v2",
         sigma: float = 1.0,
         # Phase-7 upgrade: hybrid ordinal targets + ordinal consistency loss.
@@ -412,7 +744,7 @@ class BloomLDLClassifier:
         if init_std <= 0:
             raise ValueError("init_std must be > 0")
 
-        self._enc: Optional[SentenceTransformer] = encoder
+        self._enc: Optional[StableTextEncoder] = encoder
         self.encoder_name = encoder_name
         self.sigma = float(sigma)
         self.target_hybrid_alpha = float(target_hybrid_alpha)
@@ -435,10 +767,15 @@ class BloomLDLClassifier:
     # Encoder (lazy, shared with retriever/summarizer cache)
     # ------------------------------------------------------------------ #
     @property
-    def encoder(self) -> SentenceTransformer:
+    def encoder(self) -> StableTextEncoder:
         if self._enc is None:
             logger.info(f"Loading encoder '{self.encoder_name}' on CPU")
-            self._enc = SentenceTransformer(self.encoder_name, device="cpu")
+            self._enc = StableTextEncoder(
+                self.encoder_name,
+                device="cpu",
+                local_files_only=True,
+                n_features=EMBED_DIM,
+            )
         return self._enc
 
     def encode(self, texts: Sequence[str], batch_size: int = 64) -> np.ndarray:
@@ -847,7 +1184,7 @@ class BloomLDLClassifier:
     def load(
         cls,
         path: Union[str, Path],
-        encoder: Optional[SentenceTransformer] = None,
+        encoder: Optional[StableTextEncoder] = None,
     ) -> "BloomLDLClassifier":
         path = Path(path)
         if not path.is_file():

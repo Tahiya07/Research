@@ -268,6 +268,7 @@ class CognitiveSummarizer:
         bloom_level: Optional[str] = None,
         k: int = 3,
         max_tokens: int = 160,
+        retrieved_chunks: Optional[Sequence[RetrievalResult]] = None,
     ) -> SummaryOutput:
         """Run the full Cognitive-Aware RAG pipeline.
 
@@ -301,7 +302,7 @@ class CognitiveSummarizer:
         style = self._style_for(bloom_lc)
 
         # 2. Retrieve context (Phase 1)
-        chunks = self.retriever.retrieve(query, top_k=k)
+        chunks = list(retrieved_chunks) if retrieved_chunks is not None else self.retriever.retrieve(query, top_k=k)
 
         # 3. Optional hierarchical pre-summarisation for high cognitive levels
         hier_summaries: Optional[List[str]] = None
@@ -331,38 +332,13 @@ class CognitiveSummarizer:
         # 5. Compose the final prompt manually so we can:
         #    - keep the Phase-2 prompt skeleton intact,
         #    - reuse the (possibly hierarchical) context chunks above.
-        prompt = self.generator.build_prompt(
-            query=style_query,
-            chunks=chunks,
+        gen = self.generator.generate_from_chunks(
+            style_query,
+            chunks,
             bloom_level=bloom_lc,
-        )
-        chatml = self.generator._to_chatml(prompt)
-
-        # 6. Run the LLM (CPU, deterministic), with a temporary max_tokens swap.
-        reset_fn = getattr(self.generator.llm, "reset", None)
-        if callable(reset_fn):
-            try:
-                reset_fn()
-            except Exception:  # pragma: no cover
-                pass
-
-        t0 = time.time()
-        out = self.generator.llm(
-            chatml,
             max_tokens=int(max_tokens),
-            temperature=0.0,
-            top_p=1.0,
-            top_k=1,
-            repeat_penalty=1.1,
-            stop=["<|im_end|>", "<|im_start|>"],
-            echo=False,
-            seed=self.generator.seed,
         )
-        elapsed = time.time() - t0
-        try:
-            summary = out["choices"][0]["text"].strip()
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"unexpected llm output: {out!r}") from e
+        summary = gen.answer
 
         return SummaryOutput(
             summary=summary,
@@ -371,15 +347,16 @@ class CognitiveSummarizer:
             bloom_distribution=dist if auto else None,
             confidence=conf if auto else None,
             chunks=list(chunks),
-            prompt=prompt,
+            prompt=gen.prompt,
             metadata={
                 "auto_bloom": auto,
                 "k": k,
                 "max_tokens": int(max_tokens),
                 "hierarchical": self.hierarchical,
-                "elapsed_s": round(elapsed, 3),
+                "elapsed_s": gen.metadata.get("elapsed_s"),
                 "model_path": getattr(self.generator, "model_path", "<?>"),
                 "style_query": style_query,
+                "retrieved_chunks_supplied": bool(retrieved_chunks is not None),
             },
         )
 

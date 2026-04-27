@@ -54,9 +54,7 @@ tqdm==4.67.3
 # Required only by `streamlit_app.py`. Comment out if you don't need the demo.
 streamlit==1.56.0
 
-# ---- Optional: image-OCR ingestion ------------------------------------------
-# `easyocr` is lazy-loaded by ingestion.py only when an image (PNG/JPG) is
-# ingested. Native PDF + text ingestion works WITHOUT it. easyocr pulls
-# additional heavy deps (opencv, scikit-image) so it is opt-in.
-# Uncomment the next line if you plan to ingest images:
-# easyocr==1.7.2
+# ---- Image-OCR ingestion ----------------------------------------------------
+# `easyocr` is still lazy-loaded by ingestion.py only when an image (PNG/JPG)
+# is ingested, but we pin it here so image support is part of the default setup.
+easyocr==1.7.2

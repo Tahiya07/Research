@@ -9,10 +9,17 @@ from typing import Any, Dict, List, Sequence
 
 import streamlit as st
 
-from classifier import BLOOM_LEVELS, DEFAULT_WEIGHTS_PATH, BloomLDLClassifier
+from classifier import (
+    BLOOM_LEVELS,
+    DEFAULT_WEIGHTS_PATH,
+    BloomLDLClassifier,
+    LocalOBEClassifier,
+    OBEClassifierOutput,
+)
 from evaluate import (
     DEFAULT_N_CTX,
     DEFAULT_N_THREADS,
+    _apply_retrieval_governor,
     exact_match,
     measure_model_file_mb,
     measure_rss_mb,
@@ -33,19 +40,20 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 APP_TITLE = "Lightweight Multi-Modal Tiny LLM Demo"
 UPLOAD_TYPES = ["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "txt", "md"]
+DEFAULT_FAISS_POOL = 20
 
 
 def _init_page() -> None:
     st.set_page_config(
         page_title=APP_TITLE,
-        page_icon="📚",
+        page_icon="A",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     st.title(APP_TITLE)
     st.caption(
-        "Upload PDF/image/text sources, build a local retrieval corpus, and test QA or "
-        "summarization with Bloom-level uncertainty, retrieval traces, and runtime metrics."
+        "Upload PDF/image/text sources, build a local retrieval corpus, classify exam "
+        "questions into Bloom and OBE-aligned labels, and test bounded local QA or summarization."
     )
 
 
@@ -54,6 +62,7 @@ def _runtime() -> Dict[str, Any]:
         ingestor = DocumentIngestor(chunk_size=220, chunk_overlap=32)
         retriever = PrivacyRetriever(lambda_privacy=0.5)
         classifier = BloomLDLClassifier.load(DEFAULT_WEIGHTS_PATH, encoder=retriever.model)
+        obe_classifier = LocalOBEClassifier(encoder=retriever.model)
         generator = RAGGenerator(
             retriever=retriever,
             n_ctx=DEFAULT_N_CTX,
@@ -72,6 +81,7 @@ def _runtime() -> Dict[str, Any]:
             "ingestor": ingestor,
             "retriever": retriever,
             "classifier": classifier,
+            "obe_classifier": obe_classifier,
             "generator": generator,
             "summarizer": summarizer,
             "uncertainty": uncertainty,
@@ -93,8 +103,9 @@ def _ingest_uploaded_files(
                 tmp.write(upload.getbuffer())
                 tmp_path = Path(tmp.name)
             temp_paths.append(tmp_path)
+            prev_len = len(chunks)
             chunks.extend(ingestor.process(tmp_path))
-            for c in chunks[-max(1, len(chunks)):]:
+            for c in chunks[prev_len:]:
                 if c.source == str(tmp_path):
                     c.source = upload.name
         if pasted_text.strip():
@@ -147,10 +158,36 @@ def _preview_chunk_table(chunks: Sequence[DocumentChunk]) -> List[Dict[str, Any]
     return rows
 
 
-def _run_qa(runtime: Dict[str, Any], query: str, bloom_level: str, top_k: int) -> Dict[str, Any]:
+def _governed_chunks(
+    runtime: Dict[str, Any],
+    query: str,
+    top_k: int,
+    governor_preset: str,
+) -> List[RetrievalResult]:
+    retriever: PrivacyRetriever = runtime["retriever"]
+    pool_n = max(DEFAULT_FAISS_POOL, int(top_k))
+    pool = retriever.retrieve(query, top_k=pool_n, candidate_pool=pool_n)
+    chunks, _ = _apply_retrieval_governor(
+        pool,
+        governor_preset,
+        query,
+        final_k=top_k,
+        retr=retriever,
+    )
+    return chunks
+
+
+def _run_qa(
+    runtime: Dict[str, Any],
+    query: str,
+    bloom_level: str,
+    top_k: int,
+    governor_preset: str,
+) -> Dict[str, Any]:
     generator: RAGGenerator = runtime["generator"]
     t0 = time.perf_counter()
-    output = generator.generate_answer(query=query, bloom_level=bloom_level, k=top_k)
+    chunks = _governed_chunks(runtime, query, top_k=top_k, governor_preset=governor_preset)
+    output = generator.generate_from_chunks(query, chunks, bloom_level=bloom_level)
     elapsed = time.perf_counter() - t0
     return {
         "text": output.answer,
@@ -166,10 +203,17 @@ def _run_summary(
     query: str,
     top_k: int,
     max_tokens: int,
+    governor_preset: str,
 ) -> Dict[str, Any]:
     summarizer: CognitiveSummarizer = runtime["summarizer"]
     t0 = time.perf_counter()
-    output = summarizer.summarize(query=query, k=top_k, max_tokens=max_tokens)
+    chunks = _governed_chunks(runtime, query, top_k=top_k, governor_preset=governor_preset)
+    output = summarizer.summarize(
+        query=query,
+        k=top_k,
+        max_tokens=max_tokens,
+        retrieved_chunks=chunks,
+    )
     elapsed = time.perf_counter() - t0
     return {
         "text": output.summary,
@@ -189,7 +233,7 @@ def _reference_metrics(prediction: str, reference: str) -> Dict[str, float]:
     }
 
 
-def _show_retrieval_trace(chunks: Sequence[RetrievalResult]) -> None:
+def _show_retrieval_trace(chunks: Sequence[RetrievalResult], protected_mode: bool) -> None:
     rows = []
     for chunk in chunks:
         rows.append(
@@ -199,10 +243,32 @@ def _show_retrieval_trace(chunks: Sequence[RetrievalResult]) -> None:
                 "privacy_score": round(float(chunk.privacy_score), 4),
                 "cosine": round(float(chunk.cosine), 4),
                 "infonce_risk": round(float(chunk.infonce_risk), 4),
-                "preview": chunk.text[:220] + ("..." if len(chunk.text) > 220 else ""),
+                "preview": (
+                    "[protected snippet hidden]"
+                    if protected_mode
+                    else chunk.text[:220] + ("..." if len(chunk.text) > 220 else "")
+                ),
             }
         )
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def _show_obe_result(out: OBEClassifierOutput) -> None:
+    cols = st.columns(5)
+    cols[0].metric("Bloom Level", out.bloom_level)
+    cols[1].metric("Cognitive Skill", out.cognitive_skill)
+    cols[2].metric("Subject", out.subject)
+    cols[3].metric("Topic", out.topic)
+    cols[4].metric("Confidence", f"{out.confidence:.2f}")
+
+    cols2 = st.columns(4)
+    cols2[0].metric("Subtopic", out.subtopic)
+    cols2[1].metric("Difficulty", out.difficulty)
+    cols2[2].metric("Source Type", out.source_type)
+    cols2[3].metric("Language", out.language)
+
+    with st.expander("Nearest Local OBE Examples", expanded=False):
+        st.dataframe(out.nearest_examples, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
@@ -219,7 +285,13 @@ def main() -> None:
         lambda_privacy = st.slider("Privacy lambda", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
         top_k = st.slider("Top-k retrieved chunks", min_value=1, max_value=8, value=4, step=1)
         max_tokens = st.slider("Max generation tokens", min_value=48, max_value=256, value=160, step=16)
-        mode = st.radio("Task", options=["Question Answering", "Summarization"], index=0)
+        mode = st.radio(
+            "Task",
+            options=["Question Answering", "Summarization", "Exam Question Classification"],
+            index=0,
+        )
+        protected_mode = st.toggle("Protected exam mode", value=True)
+        governor_preset = "strong" if protected_mode else "mild"
         st.caption(
             "Images rely on local OCR support. If OCR dependencies are unavailable, use PDF or pasted text."
         )
@@ -253,7 +325,7 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Corpus build failed: {exc}")
 
-    if st.session_state.get("corpus_ready"):
+    if st.session_state.get("corpus_ready") and mode != "Exam Question Classification":
         chunks: List[DocumentChunk] = st.session_state.active_chunks
         modalities = Counter(c.modality for c in chunks)
         stat_cols = st.columns(4)
@@ -263,14 +335,21 @@ def main() -> None:
         stat_cols[3].metric("Private RAM (USS)", f"{measure_uss_mb():.1f} MB")
 
         with st.expander("Corpus Preview", expanded=False):
-            st.dataframe(_preview_chunk_table(chunks), use_container_width=True, hide_index=True)
+            if protected_mode:
+                st.info("Protected exam mode hides raw chunk previews.")
+            else:
+                st.dataframe(_preview_chunk_table(chunks), use_container_width=True, hide_index=True)
 
-    query_label = "Ask a question" if mode == "Question Answering" else "Request a summary"
-    query_placeholder = (
-        "Example: Explain the main idea and give one application."
-        if mode == "Question Answering"
-        else "Example: Summarize this topic for an undergraduate learner."
-    )
+    if mode == "Question Answering":
+        query_label = "Ask a question"
+        query_placeholder = "Example: Explain the main idea and give one application."
+    elif mode == "Summarization":
+        query_label = "Request a summary"
+        query_placeholder = "Example: Summarize this topic for an undergraduate learner."
+    else:
+        query_label = "Enter an exam question"
+        query_placeholder = "Example: Compare TCP and UDP for reliability and latency trade-offs."
+
     query = st.text_area(query_label, height=120, placeholder=query_placeholder)
     reference = st.text_area(
         "Optional reference answer / summary for scoring",
@@ -279,7 +358,7 @@ def main() -> None:
     )
 
     if st.button("Run Inference", type="primary", use_container_width=True):
-        if not st.session_state.get("corpus_ready"):
+        if mode != "Exam Question Classification" and not st.session_state.get("corpus_ready"):
             st.error("Build the corpus first.")
             st.stop()
         if not query.strip():
@@ -288,6 +367,7 @@ def main() -> None:
 
         runtime["retriever"].lambda_privacy = float(lambda_privacy)
         classifier: BloomLDLClassifier = runtime["classifier"]
+        obe_classifier: LocalOBEClassifier = runtime["obe_classifier"]
         uncertainty: UncertaintyEngine = runtime["uncertainty"]
 
         try:
@@ -295,10 +375,33 @@ def main() -> None:
             bloom_level = class_out.dominant_level.lower()
             bloom_uncertainty = uncertainty.compute_bloom_uncertainty(class_out.distribution)
 
+            if mode == "Exam Question Classification":
+                st.subheader("Exam Classification")
+                _show_obe_result(obe_classifier.predict(query))
+                with st.expander("Bloom Distribution", expanded=False):
+                    rows = [
+                        {"level": level, "probability": round(float(prob), 4)}
+                        for level, prob in zip(BLOOM_LEVELS, class_out.distribution.tolist())
+                    ]
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
+                st.stop()
+
             if mode == "Question Answering":
-                result = _run_qa(runtime, query=query, bloom_level=bloom_level, top_k=top_k)
+                result = _run_qa(
+                    runtime,
+                    query=query,
+                    bloom_level=bloom_level,
+                    top_k=top_k,
+                    governor_preset=governor_preset,
+                )
             else:
-                result = _run_summary(runtime, query=query, top_k=top_k, max_tokens=max_tokens)
+                result = _run_summary(
+                    runtime,
+                    query=query,
+                    top_k=top_k,
+                    max_tokens=max_tokens,
+                    governor_preset=governor_preset,
+                )
 
             rss_mb = measure_rss_mb()
             uss_mb = measure_uss_mb()
@@ -319,7 +422,7 @@ def main() -> None:
             infra_cols[0].metric("RSS", f"{rss_mb:.1f} MB")
             infra_cols[1].metric("USS", f"{uss_mb:.1f} MB")
             infra_cols[2].metric("Model mmap", f"{model_mb:.1f} MB")
-            infra_cols[3].metric("Privacy λ", f"{lambda_privacy:.2f}")
+            infra_cols[3].metric("Privacy lambda", f"{lambda_privacy:.2f}")
 
             if metrics:
                 st.subheader("Reference-Based Quality Metrics")
@@ -337,10 +440,13 @@ def main() -> None:
                 st.dataframe(rows, use_container_width=True, hide_index=True)
 
             with st.expander("Retrieved Contexts", expanded=True):
-                _show_retrieval_trace(result["chunks"])
+                _show_retrieval_trace(result["chunks"], protected_mode=protected_mode)
 
             with st.expander("Prompt / Audit Trace", expanded=False):
-                st.code(result["prompt"], language="text")
+                if protected_mode:
+                    st.info("Protected exam mode hides raw prompt bodies to reduce reconstruction risk.")
+                else:
+                    st.code(result["prompt"], language="text")
 
             with st.expander("Run Metadata", expanded=False):
                 st.json(result["metadata"])

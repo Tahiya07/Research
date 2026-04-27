@@ -1,0 +1,69 @@
+{
+  "curated_output": "data\\curated_bloom_corpus.csv",
+  "accepted_sources": [
+    {
+      "rows": 2522,
+      "unique_questions": 2330,
+      "duplicate_questions": 192,
+      "questions_with_multiple_labels": 0,
+      "max_labels_per_question": 1,
+      "source": "figshare_exam_questions",
+      "path": "data\\figshare_combined_dataset.csv",
+      "status": "accepted",
+      "reason": "Direct English exam-question labels with no conflicting Bloom labels per question.",
+      "label_distribution": {
+        "Understand": 961,
+        "Remember": 344,
+        "Evaluate": 318,
+        "Apply": 316,
+        "Analyze": 304,
+        "Create": 279
+      }
+    }
+  ],
+  "rejected_sources": [
+    {
+      "rows": 100000,
+      "unique_questions": 1884,
+      "duplicate_questions": 98116,
+      "questions_with_multiple_labels": 1884,
+      "max_labels_per_question": 6,
+      "source": "local_obe",
+      "path": "data\\obe_dataset.csv",
+      "status": "rejected",
+      "reason": "Every unique question appears with conflicting Bloom labels, so it is not trustworthy supervision.",
+      "label_distribution": {
+        "Create": 16908,
+        "Apply": 16765,
+        "Remember": 16695,
+        "Analyze": 16630,
+        "Understand": 16514,
+        "Evaluate": 16488
+      }
+    },
+    {
+      "source": "quban_zenodo",
+      "url": "https://zenodo.org/records/10633113",
+      "status": "rejected",
+      "reason": "Questions are scored by a Bloom-keyword algorithm rather than provided as direct verified Bloom class labels.",
+      "language": "en"
+    },
+    {
+      "source": "indonesian_exam_zenodo",
+      "url": "https://zenodo.org/records/8331563",
+      "status": "rejected",
+      "reason": "Clean labels, but language is Indonesian and the corpus is small; it is not directly compatible with the current English Bloom classifier.",
+      "language": "id"
+    }
+  ],
+  "final_rows": 2330,
+  "final_unique_questions": 2330,
+  "final_label_distribution": {
+    "Understand": 915,
+    "Remember": 321,
+    "Apply": 285,
+    "Evaluate": 284,
+    "Analyze": 274,
+    "Create": 251
+  }
+}

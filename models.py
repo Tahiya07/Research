@@ -296,6 +296,73 @@ class RAGGenerator:
             f"<|im_start|>assistant\n"
         )
 
+    def _run_chatml(
+        self,
+        chatml: str,
+        *,
+        max_tokens: Optional[int] = None,
+    ) -> tuple[str, float]:
+        """Run deterministic CPU inference on an already-built ChatML prompt."""
+        reset_fn = getattr(self.llm, "reset", None)
+        if callable(reset_fn):
+            try:
+                reset_fn()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(f"llm.reset() failed: {e}")
+
+        t0 = time.time()
+        out = self.llm(
+            chatml,
+            max_tokens=int(max_tokens or self.max_tokens),
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+            repeat_penalty=1.1,
+            stop=["<|im_end|>", "<|im_start|>"],
+            echo=False,
+            seed=self.seed,
+        )
+        elapsed = time.time() - t0
+
+        try:
+            text = out["choices"][0]["text"].strip()
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"Unexpected llama-cpp output: {out!r}") from e
+        return text, elapsed
+
+    def generate_from_chunks(
+        self,
+        query: str,
+        chunks: Sequence[Union[RetrievalResult, str]],
+        *,
+        bloom_level: str = "understand",
+        max_tokens: Optional[int] = None,
+    ) -> GenerationOutput:
+        """Run generation from caller-supplied context chunks."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        bl = self._norm_bloom(bloom_level)
+        chunk_list = list(chunks)
+        prompt = self.build_prompt(query, chunk_list, bl)
+        text, elapsed = self._run_chatml(
+            self._to_chatml(prompt),
+            max_tokens=max_tokens,
+        )
+        return GenerationOutput(
+            answer=text,
+            chunks=chunk_list,
+            prompt=prompt,
+            metadata={
+                "model_path": self.model_path,
+                "bloom_level": bl,
+                "k": len(chunk_list),
+                "n_ctx": self.n_ctx,
+                "n_threads": self.n_threads,
+                "max_tokens": int(max_tokens or self.max_tokens),
+                "elapsed_s": round(elapsed, 3),
+            },
+        )
+
     # ------------------------------------------------------------------ #
     # Generation
     # ------------------------------------------------------------------ #
@@ -313,50 +380,11 @@ class RAGGenerator:
         bl = self._norm_bloom(bloom_level)
 
         chunks = self.retriever.retrieve(query, top_k=k)
-        prompt = self.build_prompt(query, chunks, bl)
-        chatml = self._to_chatml(prompt)
-
-        # Determinism: clear any KV-cache / sampler state from previous calls
-        # so that identical inputs produce identical outputs.
-        reset_fn = getattr(self.llm, "reset", None)
-        if callable(reset_fn):
-            try:
-                reset_fn()
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(f"llm.reset() failed: {e}")
-
-        t0 = time.time()
-        out = self.llm(
-            chatml,
+        return self.generate_from_chunks(
+            query,
+            chunks,
+            bloom_level=bl,
             max_tokens=self.max_tokens,
-            temperature=0.0,        # greedy
-            top_p=1.0,
-            top_k=1,
-            repeat_penalty=1.1,
-            stop=["<|im_end|>", "<|im_start|>"],
-            echo=False,
-            seed=self.seed,
-        )
-        elapsed = time.time() - t0
-
-        try:
-            text = out["choices"][0]["text"].strip()
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"Unexpected llama-cpp output: {out!r}") from e
-
-        return GenerationOutput(
-            answer=text,
-            chunks=list(chunks),
-            prompt=prompt,
-            metadata={
-                "model_path": self.model_path,
-                "bloom_level": bl,
-                "k": k,
-                "n_ctx": self.n_ctx,
-                "n_threads": self.n_threads,
-                "max_tokens": self.max_tokens,
-                "elapsed_s": round(elapsed, 3),
-            },
         )
 
 
