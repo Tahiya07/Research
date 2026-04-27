@@ -1,0 +1,44 @@
+{
+  "n_pool": 60,
+  "bloom_uncertainty_mean": 0.8048515771443937,
+  "bloom_uncertainty_std": 0.15517843503328327,
+  "uncertainty_error_correlation_pearson": 0.0655313027423981,
+  "bin_centers": [
+    0.1,
+    0.30000000000000004,
+    0.5,
+    0.7000000000000001,
+    0.9
+  ],
+  "bin_error_rate": [
+    null,
+    1.0,
+    1.0,
+    0.75,
+    0.8974358974358975
+  ],
+  "bin_counts": [
+    0,
+    2,
+    3,
+    16,
+    39
+  ],
+  "classification_accuracy": 0.13333333333333333,
+  "classification_kl": 1.1645969648909484,
+  "generation_spu": {
+    "per_query": [
+      {
+        "sample_idx": 0,
+        "spu": 0.07344730390166718,
+        "n_passes": 2
+      },
+      {
+        "sample_idx": 1,
+        "spu": 0.02732065137045399,
+        "n_passes": 2
+      }
+    ],
+    "mean": 0.05038397763606058
+  }
+}

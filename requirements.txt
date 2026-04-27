@@ -1,0 +1,62 @@
+# =============================================================================
+# Lightweight Multi-Modal Tiny LLM Framework
+#   Privacy-Preserving Academic Assistance in University Environments
+#
+# Reproducibility-grade pin set. Tested on:
+#   * OS    : Windows 10/11 (also verified on Linux x86_64)
+#   * Python: 3.13.x  (3.10 / 3.11 / 3.12 also supported)
+#   * Mode  : CPU-only, fully offline, deterministic (seed = 42)
+#
+# PyCharm install:
+#     1. Create a virtualenv (Python 3.10–3.13): Settings > Project > Python Interpreter > Add Interpreter.
+#     2. In the project root terminal:  pip install -r requirements.txt
+#     3. Mark the repo root as "Sources Root" if imports between modules fail.
+#
+# ----- IMPORTANT: torch is CPU-only -------------------------------------------
+# The pinned `torch==2.11.0` will pull a CPU wheel automatically on Windows /
+# macOS from PyPI. If pip selects a CUDA wheel on Linux, install torch
+# explicitly from the PyTorch CPU index BEFORE `pip install -r requirements.txt`:
+#
+#     pip install --index-url https://download.pytorch.org/whl/cpu torch==2.11.0
+#
+# -----------------------------------------------------------------------------
+
+# ---- Core numerical / scientific stack --------------------------------------
+numpy==2.4.4
+scipy==1.17.1
+pandas==3.0.2
+
+# ---- Deep learning runtime (CPU only) ---------------------------------------
+torch==2.11.0
+transformers==5.5.4
+tokenizers==0.22.2
+sentence-transformers==5.4.1   # all-MiniLM-L6-v2 embeddings
+huggingface-hub==1.10.2
+datasets==4.8.4                # used in offline mode (HF_DATASETS_OFFLINE=1)
+
+# ---- Retrieval & generation -------------------------------------------------
+faiss-cpu==1.13.2              # IndexFlatL2 only (no GPU build)
+llama-cpp-python==0.3.20       # Qwen-1.5B GGUF 4-bit, mmap, CPU inference
+
+# ---- Document ingestion -----------------------------------------------------
+PyMuPDF==1.27.2.2              # imported as `fitz` (native PDF text extraction)
+pillow==11.2.1                 # image I/O for OCR / DocVQA
+
+# ---- Visualisation & paper bundle -------------------------------------------
+matplotlib==3.10.8
+reportlab==4.4.10              # build_paper_pdf.py -> paper_draft.pdf
+
+# ---- System telemetry -------------------------------------------------------
+psutil==7.2.2                  # USS / RSS memory measurement (<1GB constraint)
+tqdm==4.67.3
+
+# ---- Optional: interactive demo UI ------------------------------------------
+# Required only by `streamlit_app.py`. Comment out if you don't need the demo.
+streamlit==1.56.0
+
+# ---- Optional: image-OCR ingestion ------------------------------------------
+# `easyocr` is lazy-loaded by ingestion.py only when an image (PNG/JPG) is
+# ingested. Native PDF + text ingestion works WITHOUT it. easyocr pulls
+# additional heavy deps (opencv, scikit-image) so it is opt-in.
+# Uncomment the next line if you plan to ingest images:
+# easyocr==1.7.2

@@ -1,0 +1,35 @@
+{
+  "rss_mb_now": 1100.06640625,
+  "uss_mb_now": 709.09375,
+  "model_mmap_mb": 940.369384765625,
+  "private_mb_now": 709.09375,
+  "private_metric": "uss",
+  "ram_budget_mb": 1024.0,
+  "per_system": {
+    "Proposed": {
+      "latency_mean_s": 4.323816624993924,
+      "latency_p50_s": 4.503105649986537,
+      "latency_p95_s": 5.2915692000126,
+      "n": 4
+    },
+    "VanillaRAG": {
+      "latency_mean_s": 5.552876799993101,
+      "latency_p50_s": 5.297374999994645,
+      "latency_p95_s": 7.821989379983278,
+      "n": 4
+    },
+    "BM25": {
+      "latency_mean_s": 4.980852450011298,
+      "latency_p50_s": 4.653272449999349,
+      "latency_p95_s": 6.088389965033275,
+      "n": 4
+    },
+    "NoRAG": {
+      "latency_mean_s": 4.629077700010384,
+      "latency_p50_s": 4.810940650029806,
+      "latency_p95_s": 5.478859554999508,
+      "n": 4
+    }
+  },
+  "under_1gb_budget": true
+}

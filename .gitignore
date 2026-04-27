@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# PyCharm / IDE (regenerated locally)
+.idea/
+
+# Logs & scratch
+*.log
+bench_log.txt
+debug*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Regenerable submission bundle (use: python evaluate.py --build-paper)
+paper_bundle/
