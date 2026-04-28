@@ -1,0 +1,38 @@
+{
+  "obe": {
+    "rows": 100000,
+    "unique_questions": 1884,
+    "duplicate_questions": 98116,
+    "questions_with_multiple_labels": 1884,
+    "max_labels_per_question": 6,
+    "dataset": "obe",
+    "available": true,
+    "path": "data\\obe_dataset.csv",
+    "label_distribution": {
+      "Create": 16908,
+      "Apply": 16765,
+      "Remember": 16695,
+      "Analyze": 16630,
+      "Understand": 16514,
+      "Evaluate": 16488
+    }
+  },
+  "figshare": {
+    "rows": 2522,
+    "unique_questions": 2333,
+    "duplicate_questions": 189,
+    "questions_with_multiple_labels": 0,
+    "max_labels_per_question": 1,
+    "dataset": "figshare",
+    "available": true,
+    "path": "data\\figshare_combined_dataset.csv",
+    "label_distribution": {
+      "Comprehension": 961,
+      "Knowledge": 344,
+      "Evaluation": 318,
+      "Application": 316,
+      "Analysis": 304,
+      "Synthesis": 279
+    }
+  }
+}
