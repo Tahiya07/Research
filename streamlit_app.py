@@ -30,6 +30,14 @@ from evaluate import (
 )
 from ingestion import DocumentChunk, DocumentIngestor
 from models import RAGGenerator
+from privacy_guard import (
+    STUDENT_REFUSAL,
+    allowed_chunks_for_role,
+    assess_student_query_against_protected_corpus,
+    partition_chunks,
+    policy_instruction,
+    screen_generation_output,
+)
 from retriever import PrivacyRetriever, RetrievalResult
 from summarizer import CognitiveSummarizer
 from uncertainty import UncertaintyEngine
@@ -61,6 +69,7 @@ def _runtime() -> Dict[str, Any]:
     if "demo_runtime" not in st.session_state:
         ingestor = DocumentIngestor(chunk_size=220, chunk_overlap=32)
         retriever = PrivacyRetriever(lambda_privacy=0.5)
+        protected_retriever = PrivacyRetriever(lambda_privacy=0.5, model=retriever.model)
         classifier = BloomLDLClassifier.load(DEFAULT_WEIGHTS_PATH, encoder=retriever.model)
         obe_classifier = LocalOBEClassifier(encoder=retriever.model)
         generator = RAGGenerator(
@@ -80,6 +89,7 @@ def _runtime() -> Dict[str, Any]:
         st.session_state.demo_runtime = {
             "ingestor": ingestor,
             "retriever": retriever,
+            "protected_retriever": protected_retriever,
             "classifier": classifier,
             "obe_classifier": obe_classifier,
             "generator": generator,
@@ -129,17 +139,35 @@ def _set_active_corpus(
     runtime: Dict[str, Any],
     chunks: Sequence[DocumentChunk],
     lambda_privacy: float,
+    upload_scope: str,
+    content_type: str,
 ) -> None:
     texts = [c.text for c in chunks if c.text.strip()]
     if not texts:
         raise ValueError("No usable text chunks were extracted from the uploaded inputs.")
-    retriever: PrivacyRetriever = runtime["retriever"]
+    for chunk in chunks:
+        chunk.access_level = "protected" if upload_scope == "protected" else "public"
+        chunk.content_type = str(content_type)
+
+    state_key = "protected_chunks" if upload_scope == "protected" else "public_chunks"
+    retr_key = "protected_retriever" if upload_scope == "protected" else "retriever"
+    existing: List[DocumentChunk] = list(st.session_state.get(state_key, []))
+    existing.extend(chunks)
+    texts = [c.text for c in existing if c.text.strip()]
+
+    retriever: PrivacyRetriever = runtime[retr_key]
     retriever.lambda_privacy = float(lambda_privacy)
     retriever.build_index(texts)
-    st.session_state.active_chunks = list(chunks)
-    st.session_state.active_chunk_texts = texts
-    st.session_state.active_sources = sorted({c.source for c in chunks})
-    st.session_state.corpus_ready = True
+
+    st.session_state[state_key] = existing
+    st.session_state["public_corpus_ready"] = bool(st.session_state.get("public_chunks"))
+    st.session_state["protected_corpus_ready"] = bool(st.session_state.get("protected_chunks"))
+    st.session_state["corpus_ready"] = bool(
+        st.session_state.get("public_corpus_ready") or st.session_state.get("protected_corpus_ready")
+    )
+    all_chunks = list(st.session_state.get("public_chunks", [])) + list(st.session_state.get("protected_chunks", []))
+    st.session_state.active_chunks = all_chunks
+    st.session_state.active_sources = sorted({c.source for c in all_chunks})
 
 
 def _preview_chunk_table(chunks: Sequence[DocumentChunk]) -> List[Dict[str, Any]]:
@@ -151,6 +179,8 @@ def _preview_chunk_table(chunks: Sequence[DocumentChunk]) -> List[Dict[str, Any]
                 "source": c.source,
                 "modality": c.modality,
                 "page": c.page,
+                "access": c.access_level,
+                "content_type": c.content_type,
                 "chars": len(c.text),
                 "preview": c.text[:180] + ("..." if len(c.text) > 180 else ""),
             }
@@ -159,12 +189,11 @@ def _preview_chunk_table(chunks: Sequence[DocumentChunk]) -> List[Dict[str, Any]
 
 
 def _governed_chunks(
-    runtime: Dict[str, Any],
+    retriever: PrivacyRetriever,
     query: str,
     top_k: int,
     governor_preset: str,
 ) -> List[RetrievalResult]:
-    retriever: PrivacyRetriever = runtime["retriever"]
     pool_n = max(DEFAULT_FAISS_POOL, int(top_k))
     pool = retriever.retrieve(query, top_k=pool_n, candidate_pool=pool_n)
     chunks, _ = _apply_retrieval_governor(
@@ -183,11 +212,13 @@ def _run_qa(
     bloom_level: str,
     top_k: int,
     governor_preset: str,
+    retriever: PrivacyRetriever,
+    safety_instruction: str,
 ) -> Dict[str, Any]:
     generator: RAGGenerator = runtime["generator"]
     t0 = time.perf_counter()
-    chunks = _governed_chunks(runtime, query, top_k=top_k, governor_preset=governor_preset)
-    output = generator.generate_from_chunks(query, chunks, bloom_level=bloom_level)
+    chunks = _governed_chunks(retriever, query, top_k=top_k, governor_preset=governor_preset)
+    output = generator.generate_from_chunks(query, chunks, bloom_level=bloom_level, safety_instruction=safety_instruction)
     elapsed = time.perf_counter() - t0
     return {
         "text": output.answer,
@@ -204,15 +235,18 @@ def _run_summary(
     top_k: int,
     max_tokens: int,
     governor_preset: str,
+    retriever: PrivacyRetriever,
+    safety_instruction: str,
 ) -> Dict[str, Any]:
     summarizer: CognitiveSummarizer = runtime["summarizer"]
     t0 = time.perf_counter()
-    chunks = _governed_chunks(runtime, query, top_k=top_k, governor_preset=governor_preset)
+    chunks = _governed_chunks(retriever, query, top_k=top_k, governor_preset=governor_preset)
     output = summarizer.summarize(
         query=query,
         k=top_k,
         max_tokens=max_tokens,
         retrieved_chunks=chunks,
+        safety_instruction=safety_instruction,
     )
     elapsed = time.perf_counter() - t0
     return {
@@ -285,6 +319,13 @@ def main() -> None:
         lambda_privacy = st.slider("Privacy lambda", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
         top_k = st.slider("Top-k retrieved chunks", min_value=1, max_value=8, value=4, step=1)
         max_tokens = st.slider("Max generation tokens", min_value=48, max_value=256, value=160, step=16)
+        requester_role = st.radio("Requester role", options=["Student", "Teacher / Moderator"], index=0)
+        upload_scope = st.radio("Upload target", options=["Public Learning Corpus", "Protected Exam Corpus"], index=0)
+        content_type = st.selectbox(
+            "Uploaded content type",
+            options=["study_material", "lecture_notes", "exam_paper", "moderation_material"],
+            index=0,
+        )
         mode = st.radio(
             "Task",
             options=["Question Answering", "Summarization", "Exam Question Classification"],
@@ -292,6 +333,7 @@ def main() -> None:
         )
         protected_mode = st.toggle("Protected exam mode", value=True)
         governor_preset = "strong" if protected_mode else "mild"
+        search_scope = "protected" if requester_role == "Teacher / Moderator" and upload_scope == "Protected Exam Corpus" else "public"
         st.caption(
             "Images rely on local OCR support. If OCR dependencies are unavailable, use PDF or pasted text."
         )
@@ -313,23 +355,37 @@ def main() -> None:
         build_clicked = st.button("Build / Refresh Corpus", use_container_width=True)
     with col_status:
         if st.session_state.get("corpus_ready"):
-            st.success("Corpus ready for retrieval and generation.")
+            public_n = len(st.session_state.get("public_chunks", []))
+            protected_n = len(st.session_state.get("protected_chunks", []))
+            st.success(f"Corpora ready. Public chunks: {public_n}, Protected chunks: {protected_n}.")
         else:
             st.info("Build the corpus after uploading or pasting source material.")
 
     if build_clicked:
         try:
             chunks = _ingest_uploaded_files(runtime["ingestor"], uploads or [], pasted_text)
-            _set_active_corpus(runtime, chunks, lambda_privacy=lambda_privacy)
-            st.success(f"Indexed {len(chunks)} chunks from {len(st.session_state.active_sources)} source(s).")
+            _set_active_corpus(
+                runtime,
+                chunks,
+                lambda_privacy=lambda_privacy,
+                upload_scope="protected" if upload_scope == "Protected Exam Corpus" else "public",
+                content_type=content_type,
+            )
+            st.success(f"Indexed {len(chunks)} chunks into the {upload_scope.lower()}.")
         except Exception as exc:
             st.error(f"Corpus build failed: {exc}")
 
     if st.session_state.get("corpus_ready") and mode != "Exam Question Classification":
-        chunks: List[DocumentChunk] = st.session_state.active_chunks
+        visible_chunks = allowed_chunks_for_role(
+            "teacher" if requester_role == "Teacher / Moderator" else "student",
+            st.session_state.get("public_chunks", []),
+            st.session_state.get("protected_chunks", []),
+            search_scope,
+        )
+        chunks: List[DocumentChunk] = visible_chunks
         modalities = Counter(c.modality for c in chunks)
         stat_cols = st.columns(4)
-        stat_cols[0].metric("Sources", len(st.session_state.active_sources))
+        stat_cols[0].metric("Visible Sources", len({c.source for c in chunks}))
         stat_cols[1].metric("Chunks", len(chunks))
         stat_cols[2].metric("Modalities", ", ".join(f"{k}:{v}" for k, v in sorted(modalities.items())))
         stat_cols[3].metric("Private RAM (USS)", f"{measure_uss_mb():.1f} MB")
@@ -358,19 +414,29 @@ def main() -> None:
     )
 
     if st.button("Run Inference", type="primary", use_container_width=True):
-        if mode != "Exam Question Classification" and not st.session_state.get("corpus_ready"):
-            st.error("Build the corpus first.")
+        public_chunks = list(st.session_state.get("public_chunks", []))
+        protected_chunks = list(st.session_state.get("protected_chunks", []))
+        role_key = "teacher" if requester_role == "Teacher / Moderator" else "student"
+        visible_chunks = allowed_chunks_for_role(role_key, public_chunks, protected_chunks, search_scope)
+        if mode != "Exam Question Classification" and not visible_chunks:
+            st.error("Build the appropriate corpus first.")
             st.stop()
         if not query.strip():
             st.error("Enter a question or summary request first.")
             st.stop()
 
         runtime["retriever"].lambda_privacy = float(lambda_privacy)
+        runtime["protected_retriever"].lambda_privacy = float(lambda_privacy)
         classifier: BloomLDLClassifier = runtime["classifier"]
         obe_classifier: LocalOBEClassifier = runtime["obe_classifier"]
         uncertainty: UncertaintyEngine = runtime["uncertainty"]
 
         try:
+            query_policy = assess_student_query_against_protected_corpus(query, protected_chunks)
+            if role_key == "student" and protected_chunks and not query_policy.allowed:
+                st.error(STUDENT_REFUSAL)
+                st.stop()
+
             class_out = classifier.predict(query)
             bloom_level = class_out.dominant_level.lower()
             bloom_uncertainty = uncertainty.compute_bloom_uncertainty(class_out.distribution)
@@ -393,6 +459,8 @@ def main() -> None:
                     bloom_level=bloom_level,
                     top_k=top_k,
                     governor_preset=governor_preset,
+                    retriever=runtime["protected_retriever"] if role_key == "teacher" and search_scope == "protected" else runtime["retriever"],
+                    safety_instruction=policy_instruction(role_key, search_scope),
                 )
             else:
                 result = _run_summary(
@@ -401,7 +469,17 @@ def main() -> None:
                     top_k=top_k,
                     max_tokens=max_tokens,
                     governor_preset=governor_preset,
+                    retriever=runtime["protected_retriever"] if role_key == "teacher" and search_scope == "protected" else runtime["retriever"],
+                    safety_instruction=policy_instruction(role_key, search_scope),
                 )
+
+            output_policy = screen_generation_output(role_key, query, result["text"], protected_chunks)
+            if not output_policy.allowed:
+                result["text"] = STUDENT_REFUSAL
+                result["metadata"]["privacy_block_reason"] = output_policy.reason
+                result["metadata"]["privacy_risk_score"] = round(float(output_policy.risk_score), 4)
+                result["chunks"] = []
+                result["prompt"] = "[protected prompt hidden after policy block]"
 
             rss_mb = measure_rss_mb()
             uss_mb = measure_uss_mb()
@@ -423,6 +501,9 @@ def main() -> None:
             infra_cols[1].metric("USS", f"{uss_mb:.1f} MB")
             infra_cols[2].metric("Model mmap", f"{model_mb:.1f} MB")
             infra_cols[3].metric("Privacy lambda", f"{lambda_privacy:.2f}")
+
+            if role_key == "student" and protected_chunks:
+                st.caption("Protected-corpus policy is active for student-facing requests.")
 
             if metrics:
                 st.subheader("Reference-Based Quality Metrics")

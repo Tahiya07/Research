@@ -261,6 +261,7 @@ class RAGGenerator:
         query: str,
         chunks: Sequence[Union[RetrievalResult, str]],
         bloom_level: str,
+        safety_instruction: Optional[str] = None,
     ) -> str:
         """Build the structured RAG prompt body (without ChatML wrapping)."""
         if not isinstance(query, str) or not query.strip():
@@ -286,6 +287,7 @@ class RAGGenerator:
             f"Bloom level = {bl}. {BLOOM_INSTRUCTIONS[bl]}\n\n"
             "[INSTRUCTION]\n"
             "Answer strictly using provided context. Do not hallucinate."
+            + (f"\n{str(safety_instruction).strip()}" if safety_instruction and str(safety_instruction).strip() else "")
         )
 
     def _to_chatml(self, body: str) -> str:
@@ -337,13 +339,14 @@ class RAGGenerator:
         *,
         bloom_level: str = "understand",
         max_tokens: Optional[int] = None,
+        safety_instruction: Optional[str] = None,
     ) -> GenerationOutput:
         """Run generation from caller-supplied context chunks."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         bl = self._norm_bloom(bloom_level)
         chunk_list = list(chunks)
-        prompt = self.build_prompt(query, chunk_list, bl)
+        prompt = self.build_prompt(query, chunk_list, bl, safety_instruction=safety_instruction)
         text, elapsed = self._run_chatml(
             self._to_chatml(prompt),
             max_tokens=max_tokens,

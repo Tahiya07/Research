@@ -92,6 +92,8 @@ class DocumentChunk:
     modality: str  # one of {"pdf", "image", "text"}
     page: Optional[int]
     text: str
+    access_level: str = "public"          # {"public", "protected"}
+    content_type: str = "study_material"  # {"study_material", "exam_paper", ...}
 
     def __len__(self) -> int:  # convenience: len(chunk) == #chars
         return len(self.text)

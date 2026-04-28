@@ -119,7 +119,6 @@ DEFAULT_OBE_SEARCH_PATHS: List[str] = [
 DEFAULT_WEIGHTS_PATH = "./models/bloom_ldl_weights.npz"
 
 DEFAULT_FIGSHARE_SEARCH_PATHS: List[str] = [
-    "./data/curated_bloom_corpus.csv",
     "./data/figshare_combined_dataset.csv",
     "./data/exam_combined_dataset.csv",
     "./data/datasets/exam_combined_dataset.csv",
@@ -367,57 +366,6 @@ def load_figshare_exam_dataset(
     return texts, labels
 
 
-def load_curated_bloom_dataset(
-    path: Optional[Union[str, Path]] = None,
-    max_per_class: int = 2000,
-    seed: int = 42,
-) -> Tuple[List[str], List[str]]:
-    """Load the curated Bloom corpus if present, otherwise fall back to Figshare.
-
-    Expected curated schema:
-      - question
-      - bloom_level
-    """
-    p = _find_figshare_exam_dataset(str(path) if path else None)
-    if p is None:
-        raise FileNotFoundError(
-            "Curated Bloom dataset not found and no Figshare fallback available. "
-            f"Searched: {DEFAULT_FIGSHARE_SEARCH_PATHS}"
-        )
-    import pandas as pd  # local import
-
-    df = pd.read_csv(p, low_memory=False)
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    if "question" in cols and "bloom_level" in cols:
-        qcol = cols["question"]
-        lcol = cols["bloom_level"]
-        df = df.dropna(subset=[qcol, lcol])
-        df[qcol] = df[qcol].astype(str).str.strip()
-        df[lcol] = df[lcol].apply(_normalise_bloom)
-        df = df[df[qcol].str.len() > 0]
-        df = df[df[lcol].notna()]
-        df[lcol] = df[lcol].astype(str)
-        rng = np.random.default_rng(seed)
-        parts = []
-        for lvl in BLOOM_LEVELS:
-            sub = df[df[lcol] == lvl]
-            if len(sub) == 0:
-                continue
-            n = min(len(sub), int(max_per_class))
-            idx = rng.choice(len(sub), size=n, replace=False)
-            parts.append(sub.iloc[idx])
-        out = (
-            __import__("pandas").concat(parts)
-            .sample(frac=1.0, random_state=int(seed))
-            .reset_index(drop=True)
-        )
-        texts = out[qcol].astype(str).tolist()
-        labels = out[lcol].astype(str).tolist()
-        logger.info(f"Curated Bloom dataset: {len(texts)} rows ({max_per_class}/class) loaded from {p}")
-        return texts, labels
-    return load_figshare_exam_dataset(path=p, max_per_class=max_per_class, seed=seed)
-
-
 # ----------------------------------------------------------------------------
 # Output container
 # ----------------------------------------------------------------------------
@@ -543,7 +491,6 @@ class LocalOBEClassifier:
         targets = ["bloom_level", "cognitive_skill", "difficulty", "source_type", "subject"]
         candidates = {
             "bloom_level": [
-                self.model_dir / "curated_bloom_tfidf.joblib",
                 self.model_dir / "figshare_bloom_tfidf.joblib",
                 self.model_dir / "obe_bloom_tfidf.joblib",
                 self.model_dir / "obe_bloom_level_tfidf.joblib",
@@ -555,11 +502,13 @@ class LocalOBEClassifier:
         }
         loaded: Dict[str, object] = {}
         for target in targets:
-            p = next((path for path in candidates[target] if path.is_file()), None)
-            if p is None:
-                self._pipelines = {}
-                return
-            loaded[target] = joblib.load(p)
+            chosen = next((path for path in candidates[target] if path.is_file()), None)
+            if chosen is None:
+                continue
+            try:
+                loaded[target] = joblib.load(chosen)
+            except Exception as exc:
+                logger.warning(f"Skipping unreadable cached pipeline for {target}: {chosen} ({exc})")
         self._pipelines = loaded
 
     def _nearest_examples_lexical(self, text: str, top_n: int = 3) -> List[Dict[str, str]]:
@@ -621,23 +570,41 @@ class LocalOBEClassifier:
         if not text.strip():
             raise ValueError("text must be a non-empty string")
         self._load_pipelines()
-        if self._pipelines:
+        if "bloom_level" in self._pipelines:
             bloom_pipe = self._pipelines["bloom_level"]
             bloom = str(bloom_pipe.predict([text])[0])
-            cog = str(self._pipelines["cognitive_skill"].predict([text])[0])
-            difficulty = str(self._pipelines["difficulty"].predict([text])[0])
-            source_type = str(self._pipelines["source_type"].predict([text])[0])
-            subject = str(self._pipelines["subject"].predict([text])[0])
+            examples = self._nearest_examples_lexical(text)
+            cog = "Unknown"
+            difficulty = "Unknown"
+            source_type = "Unknown"
+            subject = examples[0]["subject"] if examples else "Unknown"
+            topic = examples[0]["topic"] if examples else "Unknown"
+            if "cognitive_skill" in self._pipelines:
+                cog = str(self._pipelines["cognitive_skill"].predict([text])[0])
+            if "difficulty" in self._pipelines:
+                difficulty = str(self._pipelines["difficulty"].predict([text])[0])
+            if "source_type" in self._pipelines:
+                source_type = str(self._pipelines["source_type"].predict([text])[0])
+            if "subject" in self._pipelines:
+                subject = str(self._pipelines["subject"].predict([text])[0])
             conf = 0.0
             if hasattr(bloom_pipe, "predict_proba"):
                 probs = bloom_pipe.predict_proba([text])[0]
                 conf = float(np.max(probs))
-            examples = self._nearest_examples_lexical(text)
+            elif hasattr(bloom_pipe, "decision_function"):
+                scores = bloom_pipe.decision_function([text])
+                scores = np.asarray(scores, dtype=np.float64)
+                if scores.ndim == 2 and scores.shape[1] > 1:
+                    scores = scores[0]
+                    scores = scores - np.max(scores)
+                    exp_scores = np.exp(scores)
+                    probs = exp_scores / np.sum(exp_scores)
+                    conf = float(np.max(probs))
             return OBEClassifierOutput(
                 bloom_level=bloom,
                 cognitive_skill=cog,
                 subject=subject,
-                topic=examples[0]["topic"] if examples else "Unknown",
+                topic=topic,
                 subtopic="Unknown",
                 difficulty=difficulty,
                 source_type=source_type,

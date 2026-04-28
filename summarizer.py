@@ -269,6 +269,7 @@ class CognitiveSummarizer:
         k: int = 3,
         max_tokens: int = 160,
         retrieved_chunks: Optional[Sequence[RetrievalResult]] = None,
+        safety_instruction: Optional[str] = None,
     ) -> SummaryOutput:
         """Run the full Cognitive-Aware RAG pipeline.
 
@@ -337,6 +338,7 @@ class CognitiveSummarizer:
             chunks,
             bloom_level=bloom_lc,
             max_tokens=int(max_tokens),
+            safety_instruction=safety_instruction,
         )
         summary = gen.answer
 
